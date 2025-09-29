@@ -130,6 +130,12 @@ type Server struct {
 	// If nil, a default scheduler is chosen.
 	NewWriteScheduler func() WriteScheduler
 
+	// CountError, if non-nil, is called on HTTP/2 server errors.
+	// It's intended to increment a metric for monitoring, such
+	// as an expvar or Prometheus metric.
+	// The errType consists of only ASCII word characters.
+	CountError func(errType string)
+
 	// Internal state. This is a pointer (rather than embedded directly)
 	// so that we don't embed a Mutex in this struct, which will make the
 	// struct non-copyable, which might break some callers.
@@ -520,10 +526,12 @@ type serverConn struct {
 	clientMaxStreams            uint32 // SETTINGS_MAX_CONCURRENT_STREAMS from client (our PUSH_PROMISE limit)
 	advMaxStreams               uint32 // our SETTINGS_MAX_CONCURRENT_STREAMS advertised the client
 	curClientStreams            uint32 // number of open streams initiated by the client
+	curHandlers                 uint32 // number of running handler goroutines
 	curPushedStreams            uint32 // number of open streams initiated by server push
 	maxClientStreamID           uint32 // max ever seen from client (odd), or 0 if there have been no client requests
 	maxPushPromiseID            uint32 // ID of the last push promise (even), or 0 if there have been no pushes
 	streams                     map[uint32]*stream
+	unstartedHandlers           []unstartedHandler
 	initialStreamSendWindowSize int32
 	maxFrameSize                int32
 	headerTableSize             uint32
@@ -905,6 +913,8 @@ func (sc *serverConn) serve() {
 					return
 				case gracefulShutdownMsg:
 					sc.startGracefulShutdownInternal()
+				case handlerDoneMsg:
+					sc.handlerDone()
 				default:
 					panic("unknown timer")
 				}
@@ -950,6 +960,7 @@ var (
 	idleTimerMsg        = new(serverMessage)
 	shutdownTimerMsg    = new(serverMessage)
 	gracefulShutdownMsg = new(serverMessage)
+	handlerDoneMsg      = new(serverMessage)
 )
 
 func (sc *serverConn) onSettingsTimer() { sc.sendServeMsg(settingsTimerMsg) }
@@ -1894,8 +1905,7 @@ func (sc *serverConn) processHeaders(f *MetaHeadersFrame) error {
 		sc.conn.SetReadDeadline(time.Time{})
 	}
 
-	go sc.runHandler(rw, req, handler)
-	return nil
+	return sc.scheduleHandler(id, rw, req, handler)
 }
 
 func (st *stream) processTrailerHeaders(f *MetaHeadersFrame) error {
@@ -2143,7 +2153,62 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp requestParam) (*r
 }
 
 // Run on its own goroutine.
+type unstartedHandler struct {
+	streamID uint32
+	rw       *responseWriter
+	req      *http.Request
+	handler  func(http.ResponseWriter, *http.Request)
+}
+
+// scheduleHandler starts a handler goroutine,
+// or schedules one to start as soon as an existing handler finishes.
+func (sc *serverConn) scheduleHandler(streamID uint32, rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) error {
+	sc.serveG.check()
+	maxHandlers := sc.advMaxStreams
+	if sc.curHandlers < maxHandlers {
+		sc.curHandlers++
+		go sc.runHandler(rw, req, handler)
+		return nil
+	}
+	if len(sc.unstartedHandlers) > int(4*sc.advMaxStreams) {
+		return sc.countError("too_many_early_resets", ConnectionError(ErrCodeEnhanceYourCalm))
+	}
+	sc.unstartedHandlers = append(sc.unstartedHandlers, unstartedHandler{
+		streamID: streamID,
+		rw:       rw,
+		req:      req,
+		handler:  handler,
+	})
+	return nil
+}
+
+func (sc *serverConn) handlerDone() {
+	sc.serveG.check()
+	sc.curHandlers--
+	i := 0
+	maxHandlers := sc.advMaxStreams
+	for ; i < len(sc.unstartedHandlers); i++ {
+		u := sc.unstartedHandlers[i]
+		if sc.streams[u.streamID] == nil {
+			// This stream was reset before its goroutine had a chance to start.
+			continue
+		}
+		if sc.curHandlers >= maxHandlers {
+			break
+		}
+		sc.curHandlers++
+		go sc.runHandler(u.rw, u.req, u.handler)
+		sc.unstartedHandlers[i] = unstartedHandler{} // don't retain references
+	}
+	sc.unstartedHandlers = sc.unstartedHandlers[i:]
+	if len(sc.unstartedHandlers) == 0 {
+		sc.unstartedHandlers = nil
+	}
+}
+
+// Run on its own goroutine.
 func (sc *serverConn) runHandler(rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) {
+	defer sc.sendServeMsg(handlerDoneMsg)
 	didPanic := true
 	defer func() {
 		rw.rws.stream.cancelCtx()
@@ -2980,4 +3045,32 @@ func h1ServerKeepAlivesDisabled(hs *http.Server) bool {
 		return !hs.doKeepAlives()
 	}
 	return false
+}
+
+func (sc *serverConn) countError(name string, err error) error {
+	if sc == nil || sc.srv == nil {
+		return err
+	}
+	f := sc.srv.CountError
+	if f == nil {
+		return err
+	}
+	var typ string
+	var code ErrCode
+	switch e := err.(type) {
+	case ConnectionError:
+		typ = "conn"
+		code = ErrCode(e)
+	case StreamError:
+		typ = "stream"
+		code = ErrCode(e.Code)
+	default:
+		return err
+	}
+	codeStr := errCodeName[code]
+	if codeStr == "" {
+		codeStr = strconv.Itoa(int(code))
+	}
+	f(fmt.Sprintf("%s_%s_%s", typ, codeStr, name))
+	return err
 }
